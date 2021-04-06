@@ -135,8 +135,8 @@ struct vfu_ctx {
     void                    *tran_data;
     uint64_t                flags;
     char                    *uuid;
-    vfu_map_dma_cb_t        *map_dma;
-    vfu_unmap_dma_cb_t      *unmap_dma;
+    vfu_dma_register_cb_t   *dma_register;
+    vfu_dma_unregister_cb_t *dma_unregister;
 
     int                     client_max_fds;
 
@@ -172,34 +172,23 @@ consume_fd(int *fds, size_t nr_fds, size_t index);
 vfu_reg_info_t *
 vfu_get_region_info(vfu_ctx_t *vfu_ctx);
 
-#ifdef UNIT_TEST
-
-void
-_dma_controller_do_remove_region(dma_controller_t *dma,
-                                 dma_memory_region_t *region);
+int
+handle_device_get_info(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg);
 
 int
 handle_dma_map_or_unmap(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg);
 
-int
-handle_device_get_info(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg);
+MOCK_DECLARE(int, handle_dirty_pages, vfu_ctx_t *vfu_ctx, vfu_msg_t *msg);
 
-bool
-cmd_allowed_when_stopped_and_copying(uint16_t cmd);
+MOCK_DECLARE(int, process_request, vfu_ctx_t *vfu_ctx);
 
-bool
-should_exec_command(vfu_ctx_t *vfu_ctx, uint16_t cmd);
+MOCK_DECLARE(int, get_request_header, vfu_ctx_t *vfu_ctx, vfu_msg_t **msgp);
 
-int
-get_request_header(vfu_ctx_t *vfu_ctx, vfu_msg_t **msgp);
+MOCK_DECLARE(int, exec_command, vfu_ctx_t *vfu_ctx, vfu_msg_t *msg);
 
-int
-exec_command(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg);
+MOCK_DECLARE(bool, should_exec_command, vfu_ctx_t *vfu_ctx, uint16_t cmd);
 
-int
-process_request(vfu_ctx_t *vfu_ctx);
-
-#endif /* UNIT_TEST */
+MOCK_DECLARE(bool, cmd_allowed_when_stopped_and_copying, uint16_t cmd);
 
 #endif /* LIB_VFIO_USER_PRIVATE_H */
 

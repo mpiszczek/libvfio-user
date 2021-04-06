@@ -30,7 +30,6 @@
  *
  */
 
-#define _GNU_SOURCE
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -56,6 +55,8 @@
 #include "pci.h"
 #include "private.h"
 #include "tran_sock.h"
+
+static void vfu_reset_ctx(vfu_ctx_t *vfu_ctx, const char *reason);
 
 void
 vfu_log(vfu_ctx_t *vfu_ctx, int level, const char *fmt, ...)
@@ -153,8 +154,8 @@ dev_get_caps(vfu_ctx_t *vfu_ctx, vfu_reg_info_t *vfu_reg, bool is_migr_reg,
         for (i = 0; i < nr_mmap_areas; i++) {
             struct iovec *iov = &vfu_reg->mmap_areas[i];
 
-            vfu_log(vfu_ctx, LOG_DEBUG, "%s: area %d [%#llx-%#llx)", __func__,
-                    i, iov->iov_base, iov->iov_base + iov->iov_len);
+            vfu_log(vfu_ctx, LOG_DEBUG, "%s: area %d [%#llx, %#llx)", __func__,
+                    i, iov->iov_base, iov_end(iov));
 
             (*fds)[i] = vfu_reg->fd;
             sparse->areas[i].offset = (uintptr_t)iov->iov_base;
@@ -498,61 +499,58 @@ handle_dma_map_or_unmap(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
     }
 
     for (i = 0, fdi = 0; i < nr_dma_regions; i++) {
+        struct vfio_user_dma_region *region = &dma_regions[i];
+        char rstr[1024];
+
+        snprintf(rstr, sizeof(rstr), "[%#lx, %#lx) offset=%#lx "
+                "prot=%#x flags=%#x", region->addr, region->addr + region->size,
+                region->offset, region->prot, region->flags);
+
+        vfu_log(vfu_ctx, LOG_DEBUG, "%s DMA region %s",
+                is_map ? "adding" : "removing", rstr);
+
         if (is_map) {
             int fd = -1;
-            if (dma_regions[i].flags == VFIO_USER_F_DMA_REGION_MAPPABLE) {
+
+            if (region->flags == VFIO_USER_F_DMA_REGION_MAPPABLE) {
                 fd = consume_fd(msg->in_fds, msg->nr_in_fds, fdi++);
                 if (fd < 0) {
+                    vfu_log(vfu_ctx, LOG_ERR, "failed to add DMA region %s: "
+                            "mappable but fd not provided", rstr);
                     ret = fd;
                     break;
                 }
             }
 
-            ret = dma_controller_add_region(vfu_ctx->dma,
-                                            dma_regions[i].addr,
-                                            dma_regions[i].size,
-                                            fd,
-                                            dma_regions[i].offset,
-                                            dma_regions[i].prot);
+            ret = dma_controller_add_region(vfu_ctx->dma, (void *)region->addr,
+                                            region->size, fd, region->offset,
+                                            region->prot);
             if (ret < 0) {
                 if (fd != -1) {
                     close(fd);
                 }
-                vfu_log(vfu_ctx, LOG_INFO,
-                        "failed to add DMA region %#lx-%#lx offset=%#lx fd=%d: %s",
-                        dma_regions[i].addr,
-                        dma_regions[i].addr + dma_regions[i].size - 1,
-                        dma_regions[i].offset, fd,
-                        strerror(-ret));
+                vfu_log(vfu_ctx, LOG_ERR, "failed to add DMA region %s: %s",
+                        rstr, strerror(-ret));
                 break;
             }
-            if (vfu_ctx->map_dma != NULL) {
-                vfu_ctx->map_dma(vfu_ctx, dma_regions[i].addr,
-                                 dma_regions[i].size, dma_regions[i].prot);
+
+            if (vfu_ctx->dma_register != NULL) {
+                vfu_ctx->dma_register(vfu_ctx,
+                                      &vfu_ctx->dma->regions[ret].info);
             }
+
             ret = 0;
-            vfu_log(vfu_ctx, LOG_DEBUG,
-                    "added DMA region %#lx-%#lx offset=%#lx fd=%d prot=%#x",
-                    dma_regions[i].addr,
-                    dma_regions[i].addr + dma_regions[i].size - 1,
-                    dma_regions[i].offset, fd, dma_regions[i].prot);
         } else {
             ret = dma_controller_remove_region(vfu_ctx->dma,
-                                               dma_regions[i].addr,
-                                               dma_regions[i].size,
-                                               vfu_ctx->unmap_dma, vfu_ctx);
+                                               (void *)region->addr,
+                                               region->size,
+                                               vfu_ctx->dma_unregister,
+                                               vfu_ctx);
             if (ret < 0) {
-                vfu_log(vfu_ctx, LOG_INFO,
-                        "failed to remove DMA region %#lx-%#lx: %s",
-                        dma_regions[i].addr,
-                        dma_regions[i].addr + dma_regions[i].size - 1,
-                        strerror(-ret));
+                vfu_log(vfu_ctx, LOG_ERR, "failed to remove DMA region %s: %s",
+                        rstr, strerror(-ret));
                 break;
             }
-            vfu_log(vfu_ctx, LOG_DEBUG,
-                    "removed DMA region %#lx-%#lx",
-                    dma_regions[i].addr,
-                    dma_regions[i].addr + dma_regions[i].size - 1);
         }
     }
     return ret;
@@ -563,7 +561,7 @@ handle_device_reset(vfu_ctx_t *vfu_ctx)
 {
     vfu_log(vfu_ctx, LOG_DEBUG, "Device reset called by client");
     if (vfu_ctx->reset != NULL) {
-        return vfu_ctx->reset(vfu_ctx);
+        return vfu_ctx->reset(vfu_ctx, VFU_RESET_DEVICE);
     }
     return 0;
 }
@@ -593,7 +591,8 @@ handle_dirty_pages_get(vfu_ctx_t *vfu_ctx,
 
     for (i = 0; i < *nr_iovecs; i++) {
         struct vfio_iommu_type1_dirty_bitmap_get *r = &ranges[i];
-        ret = dma_controller_dirty_page_get(vfu_ctx->dma, r->iova, r->size,
+        ret = dma_controller_dirty_page_get(vfu_ctx->dma,
+                                            (vfu_dma_addr_t)r->iova, r->size,
                                             r->bitmap.pgsize, r->bitmap.size,
                                             (char**)&((*iovecs)[i].iov_base));
         if (ret != 0) {
@@ -613,7 +612,7 @@ out:
 }
 
 int
-handle_dirty_pages(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
+MOCK_DEFINE(handle_dirty_pages)(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
 {
     struct vfio_iommu_type1_dirty_bitmap *dirty_bitmap = msg->in_data;
     int ret;
@@ -655,8 +654,6 @@ handle_dirty_pages(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
 
     return ret;
 }
-UNIT_TEST_SYMBOL(handle_dirty_pages);
-#define handle_dirty_pages __wrap_handle_dirty_pages
 
 static vfu_msg_t *
 alloc_msg(struct vfio_user_header *hdr, int *fds, size_t nr_fds)
@@ -697,7 +694,7 @@ alloc_msg(struct vfio_user_header *hdr, int *fds, size_t nr_fds)
  * Returns 0 if we read a header, or -errno if an error occurred.
  */
 int
-get_request_header(vfu_ctx_t *vfu_ctx, vfu_msg_t **msgp)
+MOCK_DEFINE(get_request_header)(vfu_ctx_t *vfu_ctx, vfu_msg_t **msgp)
 {
     int fds[VFIO_USER_CLIENT_MAX_FDS_LIMIT] = { 0 };
     struct vfio_user_header hdr = { 0, };
@@ -707,30 +704,25 @@ get_request_header(vfu_ctx_t *vfu_ctx, vfu_msg_t **msgp)
 
     ret = vfu_ctx->tran->get_request_header(vfu_ctx, &hdr, fds, &nr_fds);
 
-    if (ret < 0) {
-        if (ret != -EINTR && ret != -EAGAIN && ret != -EWOULDBLOCK) {
-            vfu_log(vfu_ctx, LOG_ERR, "failed to get request header: %s",
-                    strerror(-ret));
+    if (unlikely(ret < 0)) {
+        switch (-ret) {
+        case EAGAIN:
+            return 0;
+
+        case ENOMSG:
+            vfu_reset_ctx(vfu_ctx, "closed");
+            return -ENOTCONN;
+
+        case ECONNRESET:
+            vfu_reset_ctx(vfu_ctx, "reset");
+            return -ENOTCONN;
+
+        default:
+            vfu_log(vfu_ctx, LOG_ERR, "failed to receive request: %s",
+                   strerror(-ret));
+            return ret;
         }
 
-        goto out;
-    }
-
-    if (unlikely(ret == 0)) {
-        if (errno == 0) {
-            ret = -ENOTCONN;
-            vfu_log(vfu_ctx, LOG_INFO, "vfio-user client closed connection");
-        } else {
-            ret = -errno;
-            vfu_log(vfu_ctx, LOG_ERR, "end of file: %m");
-        }
-
-        goto out;
-    }
-
-    if (ret != sizeof(hdr)) {
-        vfu_log(vfu_ctx, LOG_ERR, "short header read %ld", ret);
-        ret = -EINVAL;
         goto out;
     }
 
@@ -748,12 +740,11 @@ out:
         for (i = 0; i < nr_fds; i++) {
             close(fds[i]);
         }
+        return ret;
     }
 
     return ret;
 }
-UNIT_TEST_SYMBOL(get_request_header);
-#define get_request_header __wrap_get_request_header
 
 /*
  * Returns 0 if the header is valid, -errno otherwise.
@@ -782,17 +773,15 @@ validate_header(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
 }
 
 bool
-cmd_allowed_when_stopped_and_copying(uint16_t cmd)
+MOCK_DEFINE(cmd_allowed_when_stopped_and_copying)(uint16_t cmd)
 {
     return cmd == VFIO_USER_REGION_READ ||
            cmd == VFIO_USER_REGION_WRITE ||
            cmd == VFIO_USER_DIRTY_PAGES;
 }
-UNIT_TEST_SYMBOL(cmd_allowed_when_stopped_and_copying);
-#define cmd_allowed_when_stopped_and_copying __wrap_cmd_allowed_when_stopped_and_copying
 
 bool
-should_exec_command(vfu_ctx_t *vfu_ctx, uint16_t cmd)
+MOCK_DEFINE(should_exec_command)(vfu_ctx_t *vfu_ctx, uint16_t cmd)
 {
     if (device_is_stopped_and_copying(vfu_ctx->migration)) {
         if (!cmd_allowed_when_stopped_and_copying(cmd)) {
@@ -808,11 +797,9 @@ should_exec_command(vfu_ctx_t *vfu_ctx, uint16_t cmd)
     }
     return true;
 }
-UNIT_TEST_SYMBOL(should_exec_command);
-#define should_exec_command __wrap_should_exec_command
 
 int
-exec_command(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
+MOCK_DEFINE(exec_command)(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
 {
     int ret = 0;
 
@@ -864,8 +851,6 @@ exec_command(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
 
     return ret;
 }
-UNIT_TEST_SYMBOL(exec_command);
-#define exec_command __wrap_exec_command
 
 
 static void
@@ -918,7 +903,7 @@ free_msg(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
  * possibly reply.
  */
 int
-process_request(vfu_ctx_t *vfu_ctx)
+MOCK_DEFINE(process_request)(vfu_ctx_t *vfu_ctx)
 {
     vfu_msg_t *msg = NULL;
     int ret;
@@ -959,6 +944,12 @@ process_request(vfu_ctx_t *vfu_ctx)
     if (ret < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "msg%#hx: cmd %d failed: %s", msg->hdr.msg_id,
                 msg->hdr.cmd, strerror(-ret));
+
+        if (ret == -ENOTCONN) {
+            goto out;
+        }
+    } else {
+        ret = 0;
     }
 
     if (msg->hdr.flags.no_reply) {
@@ -967,9 +958,19 @@ process_request(vfu_ctx_t *vfu_ctx)
          */
         ret = 0;
     } else {
+
         ret = vfu_ctx->tran->reply(vfu_ctx, msg, -ret);
-        if (unlikely(ret < 0)) {
+
+        if (ret < 0) {
             vfu_log(vfu_ctx, LOG_ERR, "failed to reply: %s", strerror(-ret));
+
+            if (ret == -ECONNRESET) {
+                vfu_reset_ctx(vfu_ctx, "reset");
+                ret = -ENOTCONN;
+            } else if (ret == -ENOMSG) {
+                vfu_reset_ctx(vfu_ctx, "closed");
+                ret = -ENOTCONN;
+            }
         }
     }
 
@@ -977,8 +978,6 @@ out:
     free_msg(vfu_ctx, msg);
     return ret;
 }
-UNIT_TEST_SYMBOL(process_request);
-#define process_request __wrap_process_request
 
 int
 vfu_realize_ctx(vfu_ctx_t *vfu_ctx)
@@ -1092,6 +1091,28 @@ free_sparse_mmap_areas(vfu_ctx_t *vfu_ctx)
     }
 }
 
+static void
+vfu_reset_ctx(vfu_ctx_t *vfu_ctx, const char *reason)
+{
+    vfu_log(vfu_ctx, LOG_INFO, "%s: %s", __func__,  reason);
+
+    if (vfu_ctx->reset != NULL) {
+        vfu_ctx->reset(vfu_ctx, VFU_RESET_LOST_CONN);
+    }
+
+    if (vfu_ctx->dma != NULL) {
+        dma_controller_remove_regions(vfu_ctx->dma);
+    }
+
+    if (vfu_ctx->irqs != NULL) {
+        irqs_reset(vfu_ctx);
+    }
+
+    if (vfu_ctx->tran->detach != NULL) {
+        vfu_ctx->tran->detach(vfu_ctx);
+    }
+}
+
 void
 vfu_destroy_ctx(vfu_ctx_t *vfu_ctx)
 {
@@ -1100,11 +1121,10 @@ vfu_destroy_ctx(vfu_ctx_t *vfu_ctx)
         return;
     }
 
+    vfu_reset_ctx(vfu_ctx, "destroyed");
+
     free(vfu_ctx->uuid);
     free(vfu_ctx->pci.config_space);
-    if (vfu_ctx->tran->detach != NULL) {
-        vfu_ctx->tran->detach(vfu_ctx);
-    }
 
     if (vfu_ctx->tran->fini != NULL) {
         vfu_ctx->tran->fini(vfu_ctx);
@@ -1331,7 +1351,7 @@ vfu_setup_region(vfu_ctx_t *vfu_ctx, int region_idx, size_t size,
 
     for (i = 0; i < nr_mmap_areas; i++) {
         struct iovec *iov = &mmap_areas[i];
-        if ((size_t)iov->iov_base + iov->iov_len > size) {
+        if ((size_t)iov_end(iov) > size) {
             return ERROR_INT(EINVAL);
         }
     }
@@ -1381,16 +1401,14 @@ out:
 int
 vfu_setup_device_reset_cb(vfu_ctx_t *vfu_ctx, vfu_reset_cb_t *reset)
 {
-
     assert(vfu_ctx != NULL);
     vfu_ctx->reset = reset;
-
     return 0;
 }
 
 int
-vfu_setup_device_dma_cb(vfu_ctx_t *vfu_ctx, vfu_map_dma_cb_t *map_dma,
-                        vfu_unmap_dma_cb_t *unmap_dma)
+vfu_setup_device_dma(vfu_ctx_t *vfu_ctx, vfu_dma_register_cb_t *dma_register,
+                     vfu_dma_unregister_cb_t *dma_unregister)
 {
 
     assert(vfu_ctx != NULL);
@@ -1401,8 +1419,8 @@ vfu_setup_device_dma_cb(vfu_ctx_t *vfu_ctx, vfu_map_dma_cb_t *map_dma,
         return ERROR_INT(ENOMEM);
     }
 
-    vfu_ctx->map_dma = map_dma;
-    vfu_ctx->unmap_dma = unmap_dma;
+    vfu_ctx->dma_register = dma_register;
+    vfu_ctx->dma_unregister = dma_unregister;
 
     return 0;
 }
@@ -1454,33 +1472,33 @@ vfu_setup_device_migration_callbacks(vfu_ctx_t *vfu_ctx,
     return 0;
 }
 
-inline vfu_reg_info_t *
+vfu_reg_info_t *
 vfu_get_region_info(vfu_ctx_t *vfu_ctx)
 {
     assert(vfu_ctx != NULL);
     return vfu_ctx->reg_info;
 }
 
-inline int
-vfu_addr_to_sg(vfu_ctx_t *vfu_ctx, dma_addr_t dma_addr,
-               uint32_t len, dma_sg_t *sg, int max_sg, int prot)
+int
+vfu_addr_to_sg(vfu_ctx_t *vfu_ctx, vfu_dma_addr_t dma_addr,
+               size_t len, dma_sg_t *sg, int max_sg, int prot)
 {
     assert(vfu_ctx != NULL);
 
-    if (unlikely(vfu_ctx->unmap_dma == NULL)) {
+    if (unlikely(vfu_ctx->dma == NULL)) {
         return ERROR_INT(EINVAL);
     }
 
     return dma_addr_to_sg(vfu_ctx->dma, dma_addr, len, sg, max_sg, prot);
 }
 
-inline int
+int
 vfu_map_sg(vfu_ctx_t *vfu_ctx, const dma_sg_t *sg,
 	       struct iovec *iov, int cnt)
 {
     int ret;
 
-    if (unlikely(vfu_ctx->unmap_dma == NULL)) {
+    if (unlikely(vfu_ctx->dma_unregister == NULL)) {
         return ERROR_INT(EINVAL);
     }
 
@@ -1492,10 +1510,10 @@ vfu_map_sg(vfu_ctx_t *vfu_ctx, const dma_sg_t *sg,
     return 0;
 }
 
-inline void
+void
 vfu_unmap_sg(vfu_ctx_t *vfu_ctx, const dma_sg_t *sg, struct iovec *iov, int cnt)
 {
-    if (unlikely(vfu_ctx->unmap_dma == NULL)) {
+    if (unlikely(vfu_ctx->dma_unregister == NULL)) {
         return;
     }
     return dma_unmap_sg(vfu_ctx->dma, sg, iov, cnt);
@@ -1519,12 +1537,23 @@ vfu_dma_read(vfu_ctx_t *vfu_ctx, dma_sg_t *sg, void *data)
         return ERROR_INT(ENOMEM);
     }
 
-    dma_send.addr = sg->dma_addr;
+    dma_send.addr = (uint64_t)sg->dma_addr;
     dma_send.count = sg->length;
     ret = vfu_ctx->tran->send_msg(vfu_ctx, msg_id, VFIO_USER_DMA_READ,
                                   &dma_send, sizeof(dma_send), NULL,
                                   dma_recv, recv_size);
-    memcpy(data, dma_recv->data, sg->length); /* FIXME no need for memcpy */
+
+    if (ret == -ENOMSG) {
+        vfu_reset_ctx(vfu_ctx, "closed");
+        ret = -ENOTCONN;
+    } else if (ret == -ECONNRESET) {
+        vfu_reset_ctx(vfu_ctx, "reset");
+        ret = -ENOTCONN;
+    } else if (ret == 0) {
+        /* FIXME no need for memcpy */
+        memcpy(data, dma_recv->data, sg->length);
+    }
+
     free(dma_recv);
 
     return ret < 0 ? ERROR_INT(-ret) : 0;
@@ -1544,12 +1573,21 @@ vfu_dma_write(vfu_ctx_t *vfu_ctx, dma_sg_t *sg, void *data)
     if (dma_send == NULL) {
         return ERROR_INT(ENOMEM);
     }
-    dma_send->addr = sg->dma_addr;
+    dma_send->addr = (uint64_t)sg->dma_addr;
     dma_send->count = sg->length;
     memcpy(dma_send->data, data, sg->length); /* FIXME no need to copy! */
     ret = vfu_ctx->tran->send_msg(vfu_ctx, msg_id, VFIO_USER_DMA_WRITE,
                                   dma_send, send_size, NULL,
                                   &dma_recv, sizeof(dma_recv));
+
+    if (ret == -ENOMSG) {
+        vfu_reset_ctx(vfu_ctx, "closed");
+        ret = -ENOTCONN;
+    } else if (ret == -ECONNRESET) {
+        vfu_reset_ctx(vfu_ctx, "reset");
+        ret = -ENOTCONN;
+    }
+
     free(dma_send);
 
     return ret < 0 ? ERROR_INT(-ret) : 0;

@@ -55,8 +55,24 @@
 #define ROUND_DOWN(x, a)    ((x) & ~((a)-1))
 #define ROUND_UP(x,a)       ROUND_DOWN((x)+(a)-1, a)
 
-#define UNIT_TEST_SYMBOL(x) \
-    typeof(x) __wrap_##x __attribute__((weak, alias(#x)))
+#ifdef UNIT_TEST
+
+#define MOCK_DEFINE(f) \
+    (__real_ ## f)
+
+#define MOCK_DECLARE(r, f, ...) \
+    r f(__VA_ARGS__); \
+    r __real_ ## f(__VA_ARGS__); \
+    r __wrap_ ## f(__VA_ARGS__);
+
+#else /* UNIT_TEST */
+
+#define MOCK_DEFINE(f) (f)
+
+#define MOCK_DECLARE(r, f, ...) \
+    r f(__VA_ARGS__);
+
+#endif /* UNIT_TEST */
 
 #endif /* LIB_VFIO_USER_COMMON_H */
 

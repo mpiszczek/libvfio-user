@@ -30,7 +30,6 @@
  *
  */
 
-#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -57,10 +56,10 @@ typedef struct {
 } tran_sock_t;
 
 int
-tran_sock_send_iovec(int sock, uint16_t msg_id, bool is_reply,
-                     enum vfio_user_command cmd,
-                     struct iovec *iovecs, size_t nr_iovecs,
-                     int *fds, int count, int err)
+MOCK_DEFINE(tran_sock_send_iovec)(int sock, uint16_t msg_id, bool is_reply,
+                                  enum vfio_user_command cmd,
+                                  struct iovec *iovecs, size_t nr_iovecs,
+                                  int *fds, int count, int err)
 {
     int ret;
     struct vfio_user_header hdr = {.msg_id = msg_id};
@@ -114,16 +113,20 @@ tran_sock_send_iovec(int sock, uint16_t msg_id, bool is_reply,
         memcpy(CMSG_DATA(cmsg), fds, size);
     }
 
-    // FIXME: this doesn't check the entire data was sent?
-    ret = sendmsg(sock, &msg, 0);
+    ret = sendmsg(sock, &msg, MSG_NOSIGNAL);
+
     if (ret == -1) {
+        /* Treat a failed write due to EPIPE the same as a short write. */
+        if (errno == EPIPE) {
+            return -ECONNRESET;
+        }
         return -errno;
+    } else if ((size_t)ret < hdr.msg_size) {
+        return -ECONNRESET;
     }
 
     return 0;
 }
-UNIT_TEST_SYMBOL(tran_sock_send_iovec);
-#define tran_sock_send_iovec __wrap_tran_sock_send_iovec
 
 int
 tran_sock_send(int sock, uint16_t msg_id, bool is_reply,
@@ -141,7 +144,10 @@ tran_sock_send(int sock, uint16_t msg_id, bool is_reply,
                                 ARRAY_SIZE(iovecs), NULL, 0, 0);
 }
 
-int
+/*
+ * Send an empty reply back to the other end with the given errno.
+ */
+static int
 tran_sock_send_error(int sock, uint16_t msg_id,
                      enum vfio_user_command cmd,
                      int error)
@@ -169,6 +175,10 @@ get_msg(void *data, size_t len, int *fds, size_t *nr_fds, int sock_fd,
     ret = recvmsg(sock_fd, &msg, sock_flags);
     if (ret == -1) {
         return -errno;
+    } else if (ret == 0) {
+        return -ENOMSG;
+    } else if ((size_t)ret < len) {
+        return -ECONNRESET;
     }
 
     if (msg.msg_flags & MSG_CTRUNC || msg.msg_flags & MSG_TRUNC) {
@@ -205,7 +215,7 @@ get_msg(void *data, size_t len, int *fds, size_t *nr_fds, int sock_fd,
  * when we're going to return > 0 on success, and even then "errno" might be
  * better.
  */
-int
+static int
 tran_sock_recv_fds(int sock, struct vfio_user_header *hdr, bool is_reply,
                    uint16_t *msg_id, void *data, size_t *len, int *fds,
                    size_t *nr_fds)
@@ -215,11 +225,8 @@ tran_sock_recv_fds(int sock, struct vfio_user_header *hdr, bool is_reply,
     /* FIXME if ret == -1 then fcntl can overwrite recv's errno */
 
     ret = get_msg(hdr, sizeof(*hdr), fds, nr_fds, sock, 0);
-    if (ret == -1) {
-        return -errno;
-    }
-    if (ret < (int)sizeof(*hdr)) {
-        return -EINVAL;
+    if (ret < 0) {
+        return ret;
     }
 
     if (is_reply) {
@@ -250,13 +257,15 @@ tran_sock_recv_fds(int sock, struct vfio_user_header *hdr, bool is_reply,
         ret = recv(sock, data, MIN(hdr->msg_size - sizeof(*hdr), *len),
                    MSG_WAITALL);
         if (ret < 0) {
-            return ret;
-        }
-        if (*len != (size_t)ret) { /* FIXME we should allow receiving less */
-            return -EINVAL;
+            return -errno;
+        } else if (ret == 0) {
+            return -ENOMSG;
+        } else if (*len != (size_t)ret) {
+            return -ECONNRESET;
         }
         *len = ret;
     }
+
     return 0;
 }
 
@@ -305,13 +314,15 @@ tran_sock_recv_alloc(int sock, struct vfio_user_header *hdr, bool is_reply,
 
     ret = recv(sock, data, len, MSG_WAITALL);
     if (ret < 0) {
+        ret = -errno;
         free(data);
-        return -errno;
-    }
-
-    if (len != (size_t)ret) {
+        return ret;
+    } else if (ret == 0) {
         free(data);
-        return -EINVAL;
+        return -ENOMSG;
+    } else if (len != (size_t)ret) {
+        free(data);
+        return -ECONNRESET;
     }
 
     *datap = data;
@@ -444,7 +455,7 @@ out:
     return 0;
 }
 
-int
+static int
 tran_sock_get_poll_fd(vfu_ctx_t *vfu_ctx)
 {
     tran_sock_t *ts = vfu_ctx->tran_data;
@@ -535,7 +546,7 @@ out:
     return ret;
 }
 
-int
+static int
 recv_version(vfu_ctx_t *vfu_ctx, int sock, uint16_t *msg_idp,
              struct vfio_user_version **versionp)
 {
@@ -635,7 +646,7 @@ out:
     return ret;
 }
 
-int
+static int
 send_version(vfu_ctx_t *vfu_ctx, int sock, uint16_t msg_id,
              struct vfio_user_version *cversion)
 {
@@ -718,6 +729,13 @@ tran_sock_attach(vfu_ctx_t *vfu_ctx)
 
     ts = vfu_ctx->tran_data;
 
+    if (ts->conn_fd != -1) {
+        vfu_log(vfu_ctx, LOG_ERR, "%s: already attached with fd=%d",
+                __func__, ts->conn_fd);
+        errno = EINVAL;
+        return -1;
+    }
+
     ts->conn_fd = accept(ts->listen_fd, NULL, NULL);
     if (ts->conn_fd == -1) {
         return -1;
@@ -745,6 +763,11 @@ tran_sock_get_request_header(vfu_ctx_t *vfu_ctx, struct vfio_user_header *hdr,
     assert(vfu_ctx->tran_data != NULL);
 
     ts = vfu_ctx->tran_data;
+
+    if (ts->conn_fd == -1) {
+        vfu_log(vfu_ctx, LOG_ERR, "%s: not connected", __func__);
+        return -ENOTCONN;
+    }
 
     /*
      * TODO ideally we should set O_NONBLOCK on the fd so that the syscall is
@@ -782,14 +805,16 @@ tran_sock_recv_body(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
         free(msg->in_data);
         msg->in_data = NULL;
         return ret;
-    }
-
-    if (ret != (int)msg->in_size) {
+    } else if (ret == 0) {
+        free(msg->in_data);
+        msg->in_data = NULL;
+        return -ENOMSG;
+    } else if (ret != (int)msg->in_size) {
         vfu_log(vfu_ctx, LOG_ERR, "msg%#hx: short read: expected=%d, actual=%d",
                 msg->hdr.msg_id, msg->in_size, ret);
         free(msg->in_data);
         msg->in_data = NULL;
-        return -EINVAL;
+        return -ECONNRESET;
     }
 
     return 0;

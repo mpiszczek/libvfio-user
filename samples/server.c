@@ -29,7 +29,6 @@
  *
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <err.h>
 #include <stdlib.h>
@@ -49,8 +48,7 @@
 #include "tran_sock.h"
 
 struct dma_regions {
-    uint64_t addr;
-    uint64_t len;
+    struct iovec iova;
     uint32_t prot;
 };
 
@@ -70,7 +68,7 @@ struct server_data {
 static void
 _log(vfu_ctx_t *vfu_ctx UNUSED, UNUSED int level, char const *msg)
 {
-    fprintf(stderr, "server: %s\n", msg);
+    fprintf(stderr, "server[%d]: %s\n", getpid(), msg);
 }
 
 static int
@@ -86,7 +84,7 @@ arm_timer(vfu_ctx_t *vfu_ctx, time_t t)
     return 0;
 }
 
-ssize_t
+static ssize_t
 bar0_access(vfu_ctx_t *vfu_ctx, char * const buf, size_t count, loff_t offset,
             const bool is_write)
 {
@@ -115,7 +113,7 @@ bar0_access(vfu_ctx_t *vfu_ctx, char * const buf, size_t count, loff_t offset,
     return count;
 }
 
-ssize_t
+static ssize_t
 bar1_access(vfu_ctx_t *vfu_ctx, char * const buf,
             size_t count, loff_t offset,
             const bool is_write)
@@ -153,36 +151,35 @@ static void _sa_handler(int signum)
 }
 
 static void
-map_dma(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len, uint32_t prot)
+dma_register(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     struct server_data *server_data = vfu_get_private(vfu_ctx);
     int idx;
 
     for (idx = 0; idx < NR_DMA_REGIONS; idx++) {
-        if (server_data->regions[idx].addr == 0 &&
-            server_data->regions[idx].len == 0)
+        if (server_data->regions[idx].iova.iov_base == NULL &&
+            server_data->regions[idx].iova.iov_len == 0)
             break;
     }
     if (idx >= NR_DMA_REGIONS) {
         errx(EXIT_FAILURE, "Failed to add dma region, slots full\n");
     }
 
-    server_data->regions[idx].addr = iova;
-    server_data->regions[idx].len = len;
-    server_data->regions[idx].prot = prot;
+    server_data->regions[idx].iova = info->iova;
+    server_data->regions[idx].prot = info->prot;
 }
 
 static int
-unmap_dma(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len)
+dma_unregister(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     struct server_data *server_data = vfu_get_private(vfu_ctx);
     int idx;
 
     for (idx = 0; idx < NR_DMA_REGIONS; idx++) {
-        if (server_data->regions[idx].addr == iova &&
-            server_data->regions[idx].len == len) {
-            server_data->regions[idx].addr = 0;
-            server_data->regions[idx].len = 0;
+        if (server_data->regions[idx].iova.iov_len == info->iova.iov_len &&
+            server_data->regions[idx].iova.iov_base == info->iova.iov_base) {
+            server_data->regions[idx].iova.iov_base = NULL;
+            server_data->regions[idx].iova.iov_len = 0;
             return 0;
         }
     }
@@ -190,7 +187,8 @@ unmap_dma(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len)
     return -EINVAL;
 }
 
-void get_md5sum(unsigned char *buf, int len, unsigned char *md5sum)
+static void
+get_md5sum(unsigned char *buf, int len, unsigned char *md5sum)
 {
 	MD5_CTX ctx;
 
@@ -217,26 +215,28 @@ static void do_dma_io(vfu_ctx_t *vfu_ctx, struct server_data *server_data)
 
     assert(vfu_ctx != NULL);
 
-    ret = vfu_addr_to_sg(vfu_ctx, server_data->regions[0].addr, count, &sg,
-                         1, PROT_WRITE);
+    ret = vfu_addr_to_sg(vfu_ctx,
+                         (vfu_dma_addr_t)server_data->regions[0].iova.iov_base,
+                         count, &sg, 1, PROT_WRITE);
     if (ret < 0) {
-        errx(EXIT_FAILURE, "failed to map %#lx-%#lx: %s\n",
-             server_data->regions[0].addr,
-             server_data->regions[0].addr + count -1, strerror(-ret));
+        errx(EXIT_FAILURE, "failed to map %p-%p: %s\n",
+             server_data->regions[0].iova.iov_base,
+             server_data->regions[0].iova.iov_base + count -1,
+             strerror(-ret));
     }
 
     memset(buf, 'A', count);
     get_md5sum(buf, count, md5sum1);
-    printf("%s: WRITE addr %#lx count %d\n", __func__,
-           server_data->regions[0].addr, count);
+    vfu_log(vfu_ctx, LOG_DEBUG, "%s: WRITE addr %p count %d", __func__,
+           server_data->regions[0].iova.iov_base, count);
     ret = vfu_dma_write(vfu_ctx, &sg, buf);
     if (ret < 0) {
         errx(EXIT_FAILURE, "vfu_dma_write failed: %s\n", strerror(-ret));
     }
 
     memset(buf, 0, count);
-    printf("%s: READ  addr %#lx count %d\n", __func__,
-           server_data->regions[0].addr, count);
+    vfu_log(vfu_ctx, LOG_DEBUG, "%s: READ  addr %p count %d", __func__,
+           server_data->regions[0].iova.iov_base, count);
     ret = vfu_dma_read(vfu_ctx, &sg, buf);
     if (ret < 0) {
         errx(EXIT_FAILURE, "vfu_dma_read failed: %s\n", strerror(-ret));
@@ -249,10 +249,9 @@ static void do_dma_io(vfu_ctx_t *vfu_ctx, struct server_data *server_data)
     }
 }
 
-static int device_reset(vfu_ctx_t *vfu_ctx UNUSED)
+static int device_reset(vfu_ctx_t *vfu_ctx UNUSED, vfu_reset_type_t type UNUSED)
 {
-    printf("device reset callback\n");
-
+    vfu_log(vfu_ctx, LOG_DEBUG, "device reset callback");
     return 0;
 }
 
@@ -263,7 +262,8 @@ migration_device_state_transition(vfu_ctx_t *vfu_ctx, vfu_migr_state_t state)
     int ret;
     struct itimerval new = { { 0 }, };
 
-    printf("migration: transition to device state %d\n", state);
+    vfu_log(vfu_ctx, LOG_DEBUG, "migration: transition to device state %d",
+            state);
 
     switch (state) {
         case VFU_MIGR_STATE_STOP_AND_COPY:
@@ -401,14 +401,16 @@ migration_data_written(UNUSED vfu_ctx_t *vfu_ctx, UNUSED __u64 count)
     return 0;
 }
 
-size_t
+static size_t
 nr_pages(size_t size)
 {
-    return (size / sysconf(_SC_PAGE_SIZE) + (size % sysconf(_SC_PAGE_SIZE) > 1));
+    return (size / sysconf(_SC_PAGE_SIZE) +
+            (size % sysconf(_SC_PAGE_SIZE) > 1));
 }
 
-size_t
-page_align(size_t size) {
+static size_t
+page_align(size_t size)
+{
     return  nr_pages(size) * sysconf(_SC_PAGE_SIZE);
 }
 
@@ -516,7 +518,7 @@ int main(int argc, char *argv[])
         err(EXIT_FAILURE, "failed to setup device reset callbacks");
     }
 
-    ret = vfu_setup_device_dma_cb(vfu_ctx, &map_dma, &unmap_dma);
+    ret = vfu_setup_device_dma(vfu_ctx, &dma_register, &dma_unregister);
     if (ret < 0) {
         err(EXIT_FAILURE, "failed to setup device DMA callbacks");
     }
