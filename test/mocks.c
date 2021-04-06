@@ -155,6 +155,24 @@ dma_controller_unmap_region(dma_controller_t *dma,
     check_expected(region);
 }
 
+int
+tran_sock_send_iovec(int sock, uint16_t msg_id, bool is_reply,
+                     enum vfio_user_command cmd,
+                     struct iovec *iovecs, size_t nr_iovecs,
+                     int *fds, int count, int err)
+{
+    check_expected(sock);
+    check_expected(msg_id);
+    check_expected(is_reply);
+    check_expected(cmd);
+    check_expected(iovecs);
+    check_expected(nr_iovecs);
+    check_expected(fds);
+    check_expected(count);
+    check_expected(err);
+    return mock();
+}
+
 bool
 device_is_stopped(struct migration *migration)
 {
@@ -181,24 +199,6 @@ exec_command(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
     }
     check_expected(vfu_ctx);
     check_expected(msg);
-    return mock();
-}
-
-int
-tran_sock_send_iovec(int sock, uint16_t msg_id, bool is_reply,
-                     enum vfio_user_command cmd,
-                     struct iovec *iovecs, size_t nr_iovecs,
-                     int *fds, int count, int err)
-{
-    check_expected(sock);
-    check_expected(msg_id);
-    check_expected(is_reply);
-    check_expected(cmd);
-    check_expected(iovecs);
-    check_expected(nr_iovecs);
-    check_expected(fds);
-    check_expected(count);
-    check_expected(err);
     return mock();
 }
 

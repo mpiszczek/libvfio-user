@@ -51,7 +51,9 @@
 #include "private.h"
 #include "tran_sock.h"
 
-static dma_controller_t dma;
+#define DMACSIZE (sizeof(dma_controller_t) + sizeof(dma_memory_region_t) * 5)
+
+static char dmacbuf[DMACSIZE];
 static vfu_ctx_t vfu_ctx;
 static vfu_msg_t msg;
 static size_t nr_fds;
@@ -83,9 +85,12 @@ static int
 setup(void **state UNUSED)
 {
     memset(&vfu_ctx, 0, sizeof(vfu_ctx));
-    memset(&dma, 0, sizeof(dma));
-    vfu_ctx.dma = &dma;
-    dma.vfu_ctx = &vfu_ctx;
+
+    memset(dmacbuf, 0, DMACSIZE);
+
+    vfu_ctx.dma = (void *)dmacbuf;
+    vfu_ctx.dma->max_regions = 10;
+    vfu_ctx.dma->vfu_ctx = &vfu_ctx;
 
     memset(&msg, 0, sizeof(msg));
 
@@ -173,8 +178,6 @@ check_dma_info(const LargestIntegralType value,
 static void
 test_dma_add_regions_mixed(void **state UNUSED)
 {
-    dma_controller_t *d;
-    size_t count = 0;
     struct vfio_user_dma_region r[2] = {
         [0] = {
             .addr = 0xdeadbeef,
@@ -191,19 +194,13 @@ test_dma_add_regions_mixed(void **state UNUSED)
         }
     };
 
-    d = alloca(sizeof(*d) + sizeof(dma_memory_region_t) * 2);
-    memset(d, 0, sizeof(*d) + sizeof(dma_memory_region_t) * 2);
-    d->vfu_ctx = &vfu_ctx;
-    d->max_regions = 2;
-    d->regions[0].info.mapping.iov_base = (void *)0x123456789;
-    d->regions[0].info.prot = r[0].prot;
-    d->regions[1].info.mapping.iov_base = (void *)0x987654321;
-    d->regions[1].info.vaddr = (void *)0x987654321;
-    d->regions[1].info.prot = r[1].prot;
-
-    vfu_ctx.dma = d;
+    vfu_ctx.dma->nregions = 2;
+    vfu_ctx.dma->regions[0].info.mapping.iov_base = (void *)0x123456789;
+    vfu_ctx.dma->regions[0].info.prot = r[0].prot;
+    vfu_ctx.dma->regions[1].info.mapping.iov_base = (void *)0x987654321;
+    vfu_ctx.dma->regions[1].info.vaddr = (void *)0x987654321;
+    vfu_ctx.dma->regions[1].info.prot = r[1].prot;
     vfu_ctx.dma_register = mock_dma_register;
-    vfu_ctx.pvt = &count;
 
     nr_fds = 1;
     fds[0] = 0x0badf00d;
@@ -218,7 +215,8 @@ test_dma_add_regions_mixed(void **state UNUSED)
     expect_value(dma_controller_add_region, offset, r[0].offset);
     expect_value(dma_controller_add_region, prot, r[0].prot);
     expect_value(mock_dma_register, vfu_ctx, &vfu_ctx);
-    expect_check(mock_dma_register, info, check_dma_info, &d->regions[0].info);
+    expect_check(mock_dma_register, info, check_dma_info,
+                 &vfu_ctx.dma->regions[0].info);
     /* 2nd region */
     will_return(dma_controller_add_region, 1);
     expect_value(dma_controller_add_region, dma, vfu_ctx.dma);
@@ -228,12 +226,12 @@ test_dma_add_regions_mixed(void **state UNUSED)
     expect_value(dma_controller_add_region, offset, r[1].offset);
     expect_value(dma_controller_add_region, prot, r[1].prot);
     expect_value(mock_dma_register, vfu_ctx, &vfu_ctx);
-    expect_check(mock_dma_register, info, check_dma_info, &d->regions[1].info);
+    expect_check(mock_dma_register, info, check_dma_info,
+                 &vfu_ctx.dma->regions[1].info);
 
     ret = handle_dma_map_or_unmap(&vfu_ctx, mkmsg(VFIO_USER_DMA_MAP,
                                   &r, sizeof(r)));
     assert_int_equal(0, ret);
-    assert_int_equal(2, count);
     assert_int_equal(-1, fds[0]);
 }
 
@@ -339,37 +337,43 @@ static void
 test_handle_dma_unmap(void **state UNUSED)
 {
     struct vfio_user_dma_region r[2] = {
-        { .addr = 0xabcd, .size = 0x1234 },
-        { .addr = 0xbcda, .size = 0x4321 }
+        { .addr = 0xa000, .size = 0x1000 },
+        { .addr = 0xc000, .size = 0x1000 }
     };
     int ret;
 
-    ret = handle_dma_map_or_unmap(&vfu_ctx, mkmsg(VFIO_USER_DMA_UNMAP,
-                                  r, sizeof(r)));
+    ret = handle_dma_map_or_unmap(&vfu_ctx, mkmsg(VFIO_USER_DMA_MAP,
+                                  &r[0], sizeof(r[0])));
+    assert_int_equal(0, ret);
+    ret = handle_dma_map_or_unmap(&vfu_ctx, mkmsg(VFIO_USER_DMA_MAP,
+                                  &r[1], sizeof(r[1])));
+    assert_int_equal(0, ret);
 
+    vfu_ctx.dma_unregister = mock_dma_unregister;
+    expect_value(mock_dma_unregister, vfu_ctx, &vfu_ctx);
+    expect_check(mock_dma_unregister, info, check_dma_info,
+                 &vfu_ctx.dma->regions[0].info);
+    will_return(mock_dma_unregister, 0);
+
+    ret = handle_dma_map_or_unmap(&vfu_ctx, mkmsg(VFIO_USER_DMA_UNMAP,
+                                  &r[0], sizeof(r[0])));
     assert_int_equal(0, ret);
 }
 
 static void
 test_dma_controller_add_region_no_fd(void **state UNUSED)
 {
-    dma_controller_t *d = alloca(sizeof(*d) + sizeof(dma_memory_region_t));
     vfu_dma_addr_t dma_addr = (vfu_dma_addr_t)0xdeadbeef;
     dma_memory_region_t *r;
     off_t offset = 0;
     size_t size = 0;
     int fd = -1;
 
-    memset(d, 0, sizeof(*d) + sizeof(dma_memory_region_t));
-    d->vfu_ctx = &vfu_ctx;
-    d->max_regions = 1;
-    vfu_ctx.dma = d;
+    assert_int_equal(0, dma_controller_add_region(vfu_ctx.dma, dma_addr, size,
+                     fd, offset, PROT_NONE));
 
-    assert_int_equal(0, dma_controller_add_region(d, dma_addr, size, fd,
-                     offset, PROT_NONE));
-
-    assert_int_equal(1, d->nregions);
-    r = &d->regions[0];
+    assert_int_equal(1, vfu_ctx.dma->nregions);
+    r = &vfu_ctx.dma->regions[0];
     assert_ptr_equal(NULL, r->info.vaddr);
     assert_ptr_equal(NULL, r->info.mapping.iov_base);
     assert_int_equal(0, r->info.mapping.iov_len);
@@ -385,82 +389,67 @@ test_dma_controller_add_region_no_fd(void **state UNUSED)
 static void
 test_dma_controller_remove_region_mapped(void **state UNUSED)
 {
-    size_t size = sizeof(dma_controller_t) + sizeof(dma_memory_region_t);
-    dma_controller_t *d = alloca(size);
+    vfu_ctx.dma->regions[0].info.iova.iov_base = (void *)0xdeadbeef;
+    vfu_ctx.dma->regions[0].info.iova.iov_len = 0x100;
+    vfu_ctx.dma->regions[0].info.mapping.iov_base = (void *)0xcafebabe;
+    vfu_ctx.dma->regions[0].info.mapping.iov_len = 0x1000;
+    vfu_ctx.dma->regions[0].info.vaddr = (void *)0xcafebabe;
+    vfu_ctx.dma->nregions = 1;
 
-    memset(d, 0, size);
-
-    d->vfu_ctx = &vfu_ctx;
-    d->max_regions = d->nregions = 1;
-    d->regions[0].info.iova.iov_base = (void *)0xdeadbeef;
-    d->regions[0].info.iova.iov_len = 0x100;
-    d->regions[0].info.mapping.iov_base = (void *)0xcafebabe;
-    d->regions[0].info.mapping.iov_len = 0x1000;
-    d->regions[0].info.vaddr = (void *)0xcafebabe;
     expect_value(mock_dma_unregister, vfu_ctx, &vfu_ctx);
     expect_check(mock_dma_unregister, info, check_dma_info,
-                 &d->regions[0].info);
+                 &vfu_ctx.dma->regions[0].info);
     /* FIXME add unit test when dma_unregister fails */
     will_return(mock_dma_unregister, 0);
     patch("dma_controller_unmap_region");
-    expect_value(dma_controller_unmap_region, dma, d);
-    expect_value(dma_controller_unmap_region, region, &d->regions[0]);
+    expect_value(dma_controller_unmap_region, dma, vfu_ctx.dma);
+    expect_value(dma_controller_unmap_region, region, &vfu_ctx.dma->regions[0]);
     assert_int_equal(0,
-        dma_controller_remove_region(d, (void *)0xdeadbeef, 0x100,
+        dma_controller_remove_region(vfu_ctx.dma, (void *)0xdeadbeef, 0x100,
             mock_dma_unregister, &vfu_ctx));
 }
 
 static void
 test_dma_controller_remove_region_unmapped(void **state UNUSED)
 {
-    size_t size = sizeof(dma_controller_t) + sizeof(dma_memory_region_t);
-    dma_controller_t *d = alloca(size);
+    vfu_ctx.dma->nregions = 1;
+    vfu_ctx.dma->regions[0].info.iova.iov_base = (void *)0xdeadbeef;
+    vfu_ctx.dma->regions[0].info.iova.iov_len = 0x100;
+    vfu_ctx.dma->regions[0].fd = -1;
 
-    memset(d, 0, size);
-
-    d->vfu_ctx = &vfu_ctx;
-    d->max_regions = d->nregions = 1;
-    d->regions[0].info.iova.iov_base = (void *)0xdeadbeef;
-    d->regions[0].info.iova.iov_len = 0x100;
-    d->regions[0].fd = -1;
     expect_value(mock_dma_unregister, vfu_ctx, &vfu_ctx);
     expect_check(mock_dma_unregister, info, check_dma_info,
-                 &d->regions[0].info);
+                 &vfu_ctx.dma->regions[0].info);
     will_return(mock_dma_unregister, 0);
     patch("dma_controller_unmap_region");
     assert_int_equal(0,
-        dma_controller_remove_region(d, (void *)0xdeadbeef, 0x100,
+        dma_controller_remove_region(vfu_ctx.dma, (void *)0xdeadbeef, 0x100,
             mock_dma_unregister, &vfu_ctx));
 }
 
 static void
 test_dma_map_sg(void **state UNUSED)
 {
-    size_t size = sizeof(dma_controller_t) + sizeof(dma_memory_region_t);
-    dma_controller_t *d = alloca(size);
     dma_sg_t sg = { .region = 1 };
     struct iovec iovec = { 0 };
 
-    memset(d, 0, size);
-    d->vfu_ctx = &vfu_ctx;
-    d->nregions = 1;
-
     /* bad region */
-    assert_int_equal(-EINVAL, dma_map_sg(d, &sg, &iovec, 1));
+    assert_int_equal(-EINVAL, dma_map_sg(vfu_ctx.dma, &sg, &iovec, 1));
+
+    vfu_ctx.dma->nregions = 1;
 
     /* w/o fd */
     sg.region = 0;
-    assert_int_equal(-EFAULT, dma_map_sg(d, &sg, &iovec, 1));
+    assert_int_equal(-EFAULT, dma_map_sg(vfu_ctx.dma, &sg, &iovec, 1));
 
-#if 0
     /* w/ fd */
-    d->regions[0].virt_addr = (void*)0xdead0000;
+    vfu_ctx.dma->regions[0].info.vaddr = (void *)0xdead0000;
+
     sg.offset = 0x0000beef;
     sg.length = 0xcafebabe;
-    assert_int_equal(0, dma_map_sg(d, &sg, &iovec, 1));
+    assert_int_equal(0, dma_map_sg(vfu_ctx.dma, &sg, &iovec, 1));
     assert_int_equal(0xdeadbeef, iovec.iov_base);
     assert_int_equal((int)0x00000000cafebabe, iovec.iov_len);
-#endif
 }
 
 static void
